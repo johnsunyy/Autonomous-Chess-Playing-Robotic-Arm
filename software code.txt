@@ -1,0 +1,209 @@
+import cv2
+import numpy as np
+from tensorflow.keras.models import load_model
+import tkinter as tk
+from tkinter import Button
+from stockfish import Stockfish
+import threading
+import torch
+
+# Load chess piece detection model
+model_path = r"D:\\new dataset\\chess_model.h5"
+model = load_model(model_path)
+
+# Load chessboard corner detection model
+corner_model_path = r"D:\\new dataset\\best.pt"
+corner_model = torch.hub.load('ultralytics/yolov5', 'custom', path="D:\\a chess data\\Chess\\runs\\detect\\train3\\weights\\best.pt")
+
+# Load Stockfish
+stockfish_path = r"D:\\Stockfish\\stockfish\\stockfish-windows-x86-64-avx2.exe"
+stockfish = Stockfish(stockfish_path)
+stockfish.set_skill_level(10)  # Adjust skill level as needed
+
+# Global variables
+previous_board_state = None
+castling_mode = False  # Track if castling is manually enabled
+
+# Chess notation mapping
+cols = "abcdefgh"
+def index_to_notation(row, col):
+    return f"{cols[col]}{8 - row}"
+
+def toggle_castling():
+    global castling_mode
+    castling_mode = not castling_mode
+    print("Castling mode:", "Enabled" if castling_mode else "Disabled")
+
+def start_gui():
+    root = tk.Tk()
+    root.title("Chess Castling Toggle")
+    Button(root, text="Toggle Castling", command=toggle_castling).pack()
+    root.mainloop()
+
+def detect_corners(image):
+    # Run detection with YOLO model
+    results = corner_model(image)
+    
+    # Extract corner coordinates from results
+    detections = results.xyxy[0].cpu().numpy()
+    
+    # If we have at least 4 detections, use the 4 with highest confidence
+    if len(detections) >= 4:
+        # Sort by confidence (5th column)
+        sorted_detections = detections[detections[:, 4].argsort()][-4:]
+        
+        # Extract center points from bounding boxes
+        corners = []
+        for det in sorted_detections:
+            x1, y1, x2, y2 = det[0], det[1], det[2], det[3]
+            center_x, center_y = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            corners.append((center_x, center_y))
+        
+        # Order corners: top-left, top-right, bottom-left, bottom-right
+        corners.sort(key=lambda p: p[0] + p[1])  # Sort by sum of coordinates
+        if corners[1][0] < corners[2][0]:  # If second point is to the left of third
+            corners[1], corners[2] = corners[2], corners[1]  # Swap them
+        
+        return corners
+    else:
+        return None
+
+def extract_squares(image, points):
+    pts1 = np.float32(points)
+    size = 400  # Size of warped chessboard
+    pts2 = np.float32([[0, 0], [size, 0], [0, size], [size, size]])
+    matrix = cv2.getPerspectiveTransform(pts1, pts2)
+    warped = cv2.warpPerspective(image, matrix, (size, size))
+    
+    squares = []
+    square_size = size // 8
+    for i in range(8):
+        for j in range(8):
+            x, y = j * square_size, i * square_size
+            square = warped[y:y + square_size, x:x + square_size]
+            gray_square = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
+            squares.append(cv2.resize(gray_square, (64, 64)))
+    return squares
+
+def classify_squares(squares):
+    board_state = np.zeros((8, 8), dtype=int)
+    for i, square in enumerate(squares):
+        square = square / 255.0  # Normalize
+        square = np.expand_dims(square, axis=(0, -1))  # Add batch & channel dimensions
+        prediction = model.predict(square)
+        board_state[i // 8, i % 8] = int(prediction > 0.5)
+    return board_state
+
+def detect_move(previous, current):
+    global castling_mode
+    if previous is None:
+        return None
+    move_from, move_to = None, None
+    
+    for i in range(8):
+        for j in range(8):
+            if previous[i, j] == 1 and current[i, j] == 0:
+                move_from = (i, j)
+            if previous[i, j] == 0 and current[i, j] == 1:
+                move_to = (i, j)
+    
+    if castling_mode:
+        castling_mode = False  # Reset after use
+        return "O-O" if move_to and move_to[1] > move_from[1] else "O-O-O"
+    
+    if move_from and move_to:
+        return f"{index_to_notation(*move_from)}{index_to_notation(*move_to)}"
+    return None
+
+def update_board_state(board_state, move):
+    if move == "O-O":  # Kingside castling
+        board_state[7, 4] = 0  # Remove king from e1
+        board_state[7, 7] = 0  # Remove rook from h1
+        board_state[7, 6] = 1  # Place king on g1
+        board_state[7, 5] = 1  # Place rook on f1
+    elif move == "O-O-O":  # Queenside castling
+        board_state[7, 4] = 0  # Remove king from e1
+        board_state[7, 0] = 0  # Remove rook from a1
+        board_state[7, 2] = 1  # Place king on c1
+        board_state[7, 3] = 1  # Place rook on d1
+    elif move and move not in ["O-O", "O-O-O"]:
+        start, end = move[:2], move[2:]
+        start_row, start_col = 8 - int(start[1]), cols.index(start[0])
+        end_row, end_col = 8 - int(end[1]), cols.index(end[0])
+        board_state[start_row, start_col] = 0
+        board_state[end_row, end_col] = 1
+    return board_state
+
+def capture_chessboard():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return None
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Could not capture frame.")
+            cap.release()
+            return None
+        
+        # Try to detect board corners automatically
+        corners = detect_corners(frame)
+        
+        # Display the frame with corners if detected
+        display_frame = frame.copy()
+        if corners:
+            for i, (x, y) in enumerate(corners):
+                cv2.circle(display_frame, (x, y), 5, (0, 0, 255), -1)
+                cv2.putText(display_frame, str(i+1), (x+10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            # Draw chessboard outline using the detected corners
+            pts = np.array(corners, np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            cv2.polylines(display_frame, [pts], True, (0, 255, 0), 2)
+        
+        cv2.imshow("Chessboard Detection - Press 'c' to capture", display_frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('c'):
+            break
+    
+    corners = detect_corners(frame)
+    cv2.destroyAllWindows()
+    cap.release()
+    
+    if not corners:
+        print("Error: Could not detect chessboard corners. Please try again with better lighting/positioning.")
+        return None
+    
+    print(f"Automatically detected corners at: {corners}")
+    return extract_squares(frame, corners)
+
+def process():
+    global previous_board_state
+    threading.Thread(target=start_gui, daemon=True).start()
+    
+    while True:
+        squares = capture_chessboard()
+        if squares is None:
+            break
+        current_board_state = classify_squares(squares)
+        print("Board State:\n", current_board_state)
+        
+        move = detect_move(previous_board_state, current_board_state)
+        if move:
+            print("Detected Move:", move)
+            stockfish.make_moves_from_current_position([move])
+            best_move = stockfish.get_best_move()
+            print("Best Move for Robot:", best_move)
+            
+            current_board_state = update_board_state(current_board_state, best_move)
+        else:
+            print("No move detected.")
+        
+        previous_board_state = current_board_state
+        retry = input("Do you want to process another board? (y/n): ")
+        if retry.lower() != 'y':
+            break
+
+# Start processing
+process()
